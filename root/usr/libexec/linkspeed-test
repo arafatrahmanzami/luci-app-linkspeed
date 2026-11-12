@@ -38,37 +38,24 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 
-# --- JITTER MEASUREMENT ---
-URL="$1"
-HOST=$(echo "$URL" | awk -F/ '{print $3}')
-# Ping 5 times, get average latency and jitter
-if [ -n "$HOST" ]; then
-    PING_OUT=$(ping -c 5 -W 2 "$HOST" 2>/dev/null)
-    if [ $? -eq 0 ]; then
-        # Average ping
-        AVG_PING=$(echo "$PING_OUT" | tail -1 | awk -F '/' '{print $5}')
-        # Jitter (max - min)
-        MIN_PING=$(echo "$PING_OUT" | tail -1 | awk -F '/' '{print $4}')
-        MAX_PING=$(echo "$PING_OUT" | tail -1 | awk -F '/' '{print $6}')
-        JITTER_MS=$(awk "BEGIN {print $MAX_PING - $MIN_PING}")
-    else
-        AVG_PING="0"; JITTER_MS="0"
-    fi
-else
-    AVG_PING="0"; JITTER_MS="0"
-fi
-# --------------------------
 
-curl --location --silent --show-error --connect-timeout 5 --max-time 20 \
-	--connect-timeout 10 --max-time "$duration" \
-	$range_arg --output /dev/null \
-	--write-out '%{http_code}|%{remote_ip}|%{size_download}|%{speed_download}|%{time_namelookup}|%{time_connect}|%{time_starttransfer}|%{time_total}' \
-	--url "$url" >"$tmpbase.out" 2>"$tmpbase.err" &
-curl_pid=$!
-printf '%s\n%s\n' "$curl_pid" "$$" >> "$pidfile"
-wait "$curl_pid"
+
+perform_test() {
+	nice -n 19 curl --location --silent --show-error --connect-timeout 5 --max-time "$duration" \
+		$range_arg --output /dev/null \
+		--write-out '%{http_code}|%{remote_ip}|%{size_download}|%{speed_download}|%{time_namelookup}|%{time_connect}|%{time_starttransfer}|%{time_total}' \
+		--url "$1"
+}
+
+result="$(perform_test "$url")"
 curl_code=$?
-result="$(cat "$tmpbase.out")"
+
+# Smart Fallback: If HTTPS fails (timeout, SSL error), try HTTP
+if [ "$curl_code" -ne 0 ] && echo "$url" | grep -q "^https://"; then
+	url_http=$(echo "$url" | sed 's|^https://|http://|')
+	result="$(perform_test "$url_http")"
+	curl_code=$?
+fi
 
 # curl 在达到 --max-time 时返回 28，但此时统计数据仍然有效。
 if [ -n "$result" ]; then

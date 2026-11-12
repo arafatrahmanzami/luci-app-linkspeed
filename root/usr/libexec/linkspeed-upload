@@ -27,7 +27,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 dd if=/dev/zero bs=65536 $count_arg 2>/dev/null | \
-	(ulimit -v 65536 2>/dev/null; exec curl --silent --show-error --connect-timeout 10 --max-time "$duration" \
+	(exec curl --silent --show-error --connect-timeout 10 --max-time "$duration" \
 	-H 'Content-Type: application/octet-stream' -H 'Expect:' -H 'Transfer-Encoding: chunked' \
 	--request POST --upload-file - \
 	--output /dev/null \

@@ -10,7 +10,10 @@ return view.extend({
 	handleReset: null,
 
 	load: function() {
-		return uci.load('linkspeed');
+		return Promise.all([
+			uci.load('linkspeed'),
+			L.resolveDefault(uci.load('network')) // Standard OpenWrt method to ensure network config is loaded
+		]);
 	},
 
 	render: function() {
@@ -33,6 +36,22 @@ return view.extend({
 		});
 		customUrlsInput.value = customUrls.join('\n');
 
+		
+		var SERVER_NAMES = {
+			'http://hkg.download.datapacket.com/100mb.bin': 'HKG Datapacket (HK)',
+			'http://sgp.download.datapacket.com/100mb.bin': 'SGP Datapacket (SG)',
+			'http://tyo.download.datapacket.com/100mb.bin': 'TYO Datapacket (JP)',
+			'http://cachefly.cachefly.net/100mb.test': 'CacheFly (Global)',
+			'https://speed.cloudflare.com/__down?during=download&bytes=104857600': 'Cloudflare (Global)',
+			'https://mirrors.aliyun.com/ubuntu-releases/24.04/ubuntu-24.04.1-live-server-amd64.iso': 'Aliyun (CN)',
+			'https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.1-live-server-amd64.iso': 'Tsinghua (CN)'
+		};
+		function getServerName(url, fallbackPrefix) {
+			var name = SERVER_NAMES[url];
+			if (name) return name + ' - ' + url;
+			return (fallbackPrefix ? fallbackPrefix + ': ' : '') + url;
+		}
+
 		var profile = E('select', { 'class': 'cbi-input-select' }, [
 			E('option', { 'value': 'cn' }, _('China Mainland Nodes')),
 			E('option', { 'value': 'global' }, _('Overseas Nodes')),
@@ -48,9 +67,9 @@ return view.extend({
 		function refreshTargets() {
 			selected.innerHTML = '';
 			if (profile.value === 'custom') {
-				customUrls.forEach(function(url, index) { selected.appendChild(E('option', { 'value': url }, 'Custom ' + (index + 1) + ': ' + url)); });
+				customUrls.forEach(function(url, index) { selected.appendChild(E('option', { 'value': url }, getServerName(url, 'Custom ' + (index + 1)))); });
 			} else {
-				activeUrls().forEach(function(url, index) { selected.appendChild(E('option', { 'value': url }, (index + 1) + '. ' + url)); });
+				activeUrls().forEach(function(url, index) { selected.appendChild(E('option', { 'value': url }, getServerName(url, (index + 1) + '. '))); });
 			}
 			selected.appendChild(E('option', { 'value': '__custom__' }, _('Custom Temporary Link')));
 		}
@@ -61,10 +80,22 @@ return view.extend({
 			'type': 'url',
 			'placeholder': 'https://example.com/test.bin'
 		});
+		// uci.sections() returns an array of strings, not objects
+		// uci.sections() returns objects, we must map them to their names
+		var dynamicIfaces = uci.sections('network', 'interface').map(function(s) { return s['.name']; });
+		
+		// Filter out loopback and LAN (standard practice: LAN is not a WAN)
+		dynamicIfaces = dynamicIfaces.filter(function(i) { 
+			return i !== 'loopback' && i !== 'lan'; 
+		});
+		
+		// Fallback if no interfaces found
+		if (dynamicIfaces.length === 0) dynamicIfaces = ['wan'];
+		
 		var ifaceInput = E('select', { 'class': 'cbi-input-select', 'change': function() {
 			uci.set('linkspeed', 'config', 'interface', this.value);
 			uci.save('linkspeed');
-		} }, ['wan', 'wwan0', 'eth0.2', 'pppoe-wan', 'usb0'].map(function(i) {
+		} }, dynamicIfaces.map(function(i) {
 			return E('option', { 'value': i }, i);
 		}));
 		ifaceInput.value = uci.get('linkspeed', 'config', 'interface') || 'wan';
@@ -73,6 +104,8 @@ return view.extend({
 			'class': 'cbi-input-text', 'type': 'number', 'min': '3', 'max': '86400',
 			'value': uci.get('linkspeed', 'config', 'duration') || '15'
 		});
+		var pingCount = E('input', { 'class': 'cbi-input-text', 'type': 'number', 'min': '1', 'max': '20', 'value': '5' });
+		var concurrency = E('input', { 'class': 'cbi-input-text', 'type': 'number', 'min': '2', 'max': '10', 'value': '5' });
 		var maxMb = E('input', {
 			'class': 'cbi-input-text', 'type': 'number', 'min': '0',
 			'value': uci.get('linkspeed', 'config', 'max_megabytes') || '100'
@@ -170,6 +203,56 @@ return view.extend({
 			live.previous = { rx: rx, tx: tx, time: now };
 		}
 
+		
+		function runPing() {
+			var url = selected.value;
+			if (url === '__custom__') url = custom.value;
+			if (!url) return;
+
+			var host = url.replace(/^https?:\/\//, '').split('/')[0];
+			setStatus(_('Testing ping and jitter to ') + host + '...', 'notice');
+
+			var section = document.getElementById('linkspeed-ping-section');
+			
+			// Show a clean loading state
+			if (section) {
+				section.style.display = 'block';
+				section.innerHTML = '<h3>' + _('Ping & Jitter Result') + '</h3>' +
+					'<div class="cbi-section-node">' +
+						'<div class="cbi-value"><label class="cbi-value-title">' + _('Status') + '</label><div class="cbi-value-field"><em>' + _('Pinging ') + host + '...</em></div></div>' +
+					'</div>';
+			}
+
+			return fs.exec('/usr/libexec/linkspeed-ping', [ url, pingCount.value ]).then(function(res) {
+				var out = String(res.stdout || '').trim();
+				var parts = out.split('|');
+				if (Number(parts[0]) === 0) parts[0] = parts[1];
+				if (Number(parts[2]) === 0) parts[2] = parts[1];
+				
+				if (parts.length === 4 && Number(parts[1]) > 0) {
+					// Render a beautiful LuCI table
+					if (section) {
+						section.innerHTML = '<h3 style="font-size: 1.4em; font-weight: bold; margin-bottom: 15px;">' + _('Ping & Jitter Result') + '</h3>' +
+							'<div class="cbi-section-node" style="padding: 10px 0;">' +
+								'<div class="cbi-value" style="margin-bottom: 10px;"><label class="cbi-value-title" style="font-size: 1.2em; color: #aaaaaa;">' + _('Host') + '</label><div class="cbi-value-field"><span style="font-size: 1.3em; color: #4da6ff; font-weight: bold;">' + host + '</span></div></div>' +
+								'<div class="cbi-value" style="margin-bottom: 10px;"><label class="cbi-value-title" style="font-size: 1.2em; color: #aaaaaa;">' + _('Average Latency') + '</label><div class="cbi-value-field"><span style="font-size: 1.6em; color: #00ff00; font-weight: bold;">' + parts[1] + ' ms</span></div></div>' +
+								'<div class="cbi-value" style="margin-bottom: 10px;"><label class="cbi-value-title" style="font-size: 1.2em; color: #aaaaaa;">' + _('Min / Max') + '</label><div class="cbi-value-field"><span style="font-size: 1.3em; color: #ffffff;">' + parts[0] + ' ms / ' + parts[2] + ' ms</span></div></div>' +
+								'<div class="cbi-value"><label class="cbi-value-title" style="font-size: 1.2em; color: #aaaaaa;">' + _('Jitter') + '</label><div class="cbi-value-field"><span style="font-size: 1.3em; color: #ffca28;">' + parts[3] + ' ms</span></div></div>' +
+							'</div>';
+					}
+					setStatus(_('Ping test completed successfully.'), 'success');
+				} else {
+					if (section) {
+						section.innerHTML = '<h3>' + _('Ping Result') + '</h3><div class="cbi-section-node"><div class="cbi-value"><div class="cbi-value-field" style="color:red;">' + _('Server Unreachable or Timeout.') + '</div></div></div>';
+					}
+					setStatus(_('Ping failed.'), 'error');
+				}
+			}).catch(function(err) {
+				if (section) section.innerHTML = '<h3>' + _('Ping Error') + '</h3><div class="cbi-section-node"><div class="cbi-value"><div class="cbi-value-field" style="color:red;">' + String(err) + '</div></div></div>';
+				setStatus(_('Ping error.'), 'error');
+			});
+		}
+
 		function runJob(program, args) {
 			var jobId = String(Date.now());
 			beginLiveChart();
@@ -184,7 +267,7 @@ return view.extend({
 							var body = pos >= 0 ? output.substring(pos + 1) : '';
 							updateLiveChart(Number(header[1]), Number(header[2]));
 							if (state === 'RUNNING')
-								window.setTimeout(poll, 1000);
+								window.setTimeout(poll, 2000);
 							else if (state === 'DONE')
 								resolve({ stdout: body });
 							else
@@ -229,6 +312,9 @@ return view.extend({
 				if (runId !== activeRun) return;
 				var data = parseMetrics(res.stdout);
 				var mbps = Number(data.speed_download || 0) * 8 / 1000000;
+				if (mbps === 0) {
+					throw new Error(_('Test failed. HTTP Status: ') + (data.http_code || 'Unknown') + _('. The server may be blocking requests or timing out.'));
+				}
 				result.innerHTML = '';
 				result.appendChild(E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, _('Single Node Result')),
@@ -243,7 +329,7 @@ return view.extend({
 
 		function runMulti() {
 			var runId = ++activeRun;
-			var targets = activeUrls().slice(0, 5);
+			var num = Number(concurrency.value) || 5; var targets = activeUrls().slice(0, num);
 			if (targets.length < 2 || !validNumber(duration, 3, 86400) || !validNumber(maxMb, 0, Number.MAX_SAFE_INTEGER)) {
 				setStatus(_('Invalid number of nodes or Test Parameters.'), 'error');
 				return;
@@ -317,7 +403,7 @@ return view.extend({
 
 		function runDuplex() {
 			var runId = ++activeRun;
-			var targets = activeUrls().slice(0, 5);
+			var num = Number(concurrency.value) || 5; var targets = activeUrls().slice(0, num);
 			if (targets.length < 2 || !validNumber(duration, 3, 86400) || !validNumber(maxMb, 0, Number.MAX_SAFE_INTEGER)) {
 				setStatus(_('Invalid number of nodes or Test Parameters.'), 'error');
 				return;
@@ -454,8 +540,11 @@ return view.extend({
 				E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, _('WAN Interface')), E('div', { 'class': 'cbi-value-field' }, ifaceInput) ]),
 				E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, _('Max Duration (seconds)')), E('div', { 'class': 'cbi-value-field' }, duration) ]),
 				E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, _('Max Traffic per Direction (MB)')), E('div', { 'class': 'cbi-value-field' }, [ maxMb, maxMbHint ]) ]),
+				E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, _('Ping Count')), E('div', { 'class': 'cbi-value-field' }, [ pingCount, E('div', { 'class': 'cbi-value-description' }, _('Number of packets to send for Ping/Jitter test.')) ]) ]),
+				E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, _('Concurrent Connections')), E('div', { 'class': 'cbi-value-field' }, [ concurrency, E('div', { 'class': 'cbi-value-description' }, _('Number of parallel streams for the Concurrent Test (2-10).')) ]) ]),
 				E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, _('History Retention (times)')), E('div', { 'class': 'cbi-value-field' }, [ historyLimit, E('div', { 'class': 'cbi-value-description' }, _('Each complete speed test counts as one record, range 1-200; written to disk all at once upon completion.')) ]) ]),
 				E('div', { 'class': 'cbi-page-actions' }, [
+					E('button', { 'class': 'btn cbi-button-neutral', 'click': runPing }, _('Ping / Jitter Test')), ' ',
 					E('button', { 'class': 'btn cbi-button-action', 'click': runSingle }, _('Single Node Test')),
 					' ', E('button', { 'class': 'btn cbi-button-positive', 'click': runMulti }, _('Five Node Concurrent Test')),
 					' ', E('button', { 'class': 'btn cbi-button-action', 'click': runUpload }, _('Three-Way Upload Test')),
@@ -464,6 +553,7 @@ return view.extend({
 				])
 			]),
 			result,
+			E('div', { 'class': 'cbi-section', 'id': 'linkspeed-ping-section', 'style': 'display: none;' }),
 			E('div', { 'class': 'cbi-section' }, [ E('h3', {}, _('Speed Test History')), E('button', { 'class': 'btn cbi-button-action', 'click': loadHistory }, _('Refresh History')), historyResult ])
 		]);
 	}
